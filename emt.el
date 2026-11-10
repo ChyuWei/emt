@@ -5,7 +5,7 @@
 ;; Author: Roife Wu <roifewu@gmail.com>
 ;; URL: https://github.com/roife/emt
 ;; Version: 2.1.2
-;; Package-Requires: ((emacs "26.1"))
+;; Package-Requires: ((emacs "31.1"))
 ;; Keywords: chinese, cjk, tokenizer, macos, mac, natural language, segmentation
 
 ;; This file is NOT a part of GNU Emacs.
@@ -28,6 +28,10 @@
 ;; EMT stands for Emacs MacOS Tokenizer.
 ;; This package use macOS's built-in NLP tokenizer to tokenize and operate on
 ;; CJK words in Emacs.
+;;
+;; `emt-mode' installs a handler in `find-word-boundary-function-table' for
+;; CJK word characters, so commands based on `forward-word' and
+;; `backward-word' use emt's tokenization automatically.
 
 ;;; Code:
 
@@ -124,9 +128,134 @@
                           value)))
     (setq key (string-trim (substring-no-properties key) "\\W*" "\\W*"))
     (puthash key value emt--cache-set)
+    (setq emt--cache-lru-list (delete key emt--cache-lru-list))
     (push key emt--cache-lru-list)
     (when (> (length emt--cache-lru-list) emt-cache-lru-size)
       (setq emt--cache-lru-list (butlast emt--cache-lru-list)))))
+
+;;; Word boundary integration
+
+(defun emt--cjk-word-char-p (char &optional category-set)
+  "Return non-nil if CHAR is a CJK word character.
+
+CATEGORY-SET, when non-nil, is used instead of the category set of CHAR."
+  (and (integerp char)
+       (with-syntax-table (standard-syntax-table)
+         (eq (char-syntax char) ?w))
+       (let ((category-set (or category-set (char-category-set char))))
+         (and category-set
+              (or (aref category-set ?c)
+                  (aref category-set ?j)
+                  (aref category-set ?h))))))
+
+(defun emt--cjk-run-bounds (pos)
+  "Return the bounds of the CJK word run containing POS.
+
+The returned value is a cons cell (BEG . END)."
+  (save-excursion
+    (let ((inhibit-field-text-motion t))
+      (goto-char pos)
+      (let ((end (progn (forward-word-strictly 1) (point))))
+        (goto-char pos)
+        (let ((beg (progn (backward-word-strictly 1) (point))))
+          ;; `forward-word-strictly' can include an adjacent non-CJK word
+          ;; when POS is exactly at a script boundary.  Trim to CJK chars.
+          (save-excursion
+            (goto-char beg)
+            (when (re-search-forward "\\(\\cc\\|\\cj\\|\\ch\\)" (1+ pos) t)
+              (setq beg (match-beginning 0))))
+          (save-excursion
+            (goto-char end)
+            (when (re-search-backward "\\(\\cc\\|\\cj\\|\\ch\\)" beg t)
+              (setq end (match-end 0))))
+          (cons beg end))))))
+
+(defun emt--token-at (tokens index)
+  "Return the token in TOKENS containing INDEX, or nil.
+
+TOKENS can be a list or a vector."
+  (let (token)
+    (mapc (lambda (bounds)
+            (when (and (not token)
+                       (<= (car bounds) index)
+                       (< index (cdr bounds)))
+              (setq token bounds)))
+          tokens)
+    token))
+
+(defun emt--boundary-fallback (pos limit forward-p)
+  "Return a safe one-character boundary for POS, bounded by LIMIT."
+  (if forward-p
+      (min limit (1+ pos))
+    (max limit pos)))
+
+(defun emt--find-word-boundary (pos limit)
+  "Find the word boundary at POS, bounded by LIMIT.
+
+This is the handler installed in `find-word-boundary-function-table'."
+  (let ((forward-p (< pos limit)))
+    (if (not emt--lib-loaded)
+        (emt--boundary-fallback pos limit forward-p)
+      (let* ((bounds (emt--cjk-run-bounds pos))
+             (beg (car bounds))
+             (end (cdr bounds)))
+        (if (or (>= beg end)
+                (not (emt--cjk-word-char-p (char-after pos))))
+            (emt--boundary-fallback pos limit forward-p)
+          (let* ((text (buffer-substring-no-properties beg end))
+                 (index (- pos beg))
+                 (tokens (condition-case nil
+                             (emt-split text)
+                           (error nil)))
+                 (token (emt--token-at tokens index)))
+            (cond
+             ((null token)
+              (emt--boundary-fallback pos limit forward-p))
+             (forward-p
+              (min limit (+ beg (cdr token))))
+             (t
+              (max limit (+ beg (car token)))))))))))
+
+(defun emt--build-boundary-table ()
+  "Build and return a char table for CJK word boundaries."
+  (let ((table (make-char-table nil)))
+    (map-char-table
+     (lambda (range category-set)
+       (let ((char (if (consp range) (car range) range)))
+         (when (and (integerp char)
+                    (emt--cjk-word-char-p char category-set))
+           (set-char-table-range table range 'emt--find-word-boundary))))
+     (standard-category-table))
+    table))
+
+(defvar emt--boundary-table nil
+  "Char table used for CJK word boundaries.")
+
+(defvar emt--saved-boundary-table nil
+  "Saved default value of `find-word-boundary-function-table'.")
+
+(defvar emt--boundary-table-installed nil
+  "Non-nil if `emt--boundary-table' is installed.")
+
+(defun emt--install-boundary-table ()
+  "Install `emt--boundary-table' as the default word boundary table."
+  (unless emt--boundary-table-installed
+    (unless emt--boundary-table
+      (setq emt--boundary-table (emt--build-boundary-table)))
+    (setq emt--saved-boundary-table
+          (default-value 'find-word-boundary-function-table))
+    (set-default 'find-word-boundary-function-table emt--boundary-table)
+    (setq emt--boundary-table-installed t)))
+
+(defun emt--uninstall-boundary-table ()
+  "Restore the default word boundary table."
+  (when emt--boundary-table-installed
+    (when (eq (default-value 'find-word-boundary-function-table)
+              emt--boundary-table)
+      (set-default 'find-word-boundary-function-table
+                   emt--saved-boundary-table))
+    (setq emt--boundary-table-installed nil)
+    (setq emt--saved-boundary-table nil)))
 
 (defun emt--get-bounds-at-point (direction)
   "Get the bounds of the CJK string at point.
@@ -139,13 +268,13 @@ If DIRECTION is `'all', return the bounds of the string forward and backward."
          (end pos))
     (when (or (eq direction 'forward) (eq direction 'all))
       (save-excursion
-        (forward-word)
+        (forward-word-strictly 1)
         (when (string-match-p emt--cjk-regex-forward
                               (buffer-substring-no-properties pos (point)))
           (setq end (point)))))
     (when (or (eq direction 'backward) (eq direction 'all))
       (save-excursion
-        (backward-word)
+        (backward-word-strictly 1)
         (when (string-match-p emt--cjk-regex-backward
                               (buffer-substring-no-properties (point) pos))
           (setq beg (point)))))
@@ -210,7 +339,7 @@ If DIRECTION is `'backward', move point backward by word."
               (`(,beg . ,end) (emt--get-bounds-at-point
                                (emt--move-by-word-decide-bounds-direction direction))))
     (if (eq beg end)
-        (if forward-p (forward-word) (backward-word))
+        (if forward-p (forward-word-strictly 1) (backward-word-strictly 1))
       (let* ((text (buffer-substring-no-properties beg end))
              (pos (- (point) beg))
              (pred (if forward-p (lambda (x) (> x pos)) (lambda (x) (< x pos))))
@@ -219,15 +348,15 @@ If DIRECTION is `'backward', move point backward by word."
                                     (mapcar (if forward-p #'cdr #'car) (emt-split text)))))
         (if (and target-bound (funcall pred target-bound))
             (goto-char (+ beg target-bound))
-          (if forward-p (forward-word) (backward-word)))))))
+          (if forward-p (forward-word-strictly 1) (backward-word-strictly 1)))))))
 
 (defun emt-split (str)
-  "Split STR into a list of words.
+  "Split STR into a sequence of words.
 
-Return a list of word bounds (a cons of the beginning position and the ending
-position of a word)"
+Return a sequence of word bounds (a cons of the beginning position and the
+ending position of a word)."
   (if emt--lib-loaded
-      (if-let ((cached (and emt-use-cache (emt--cache-get str))))
+      (if-let* ((cached (and emt-use-cache (emt--cache-get str))))
           cached
         (let ((result (emt--do-split-helper str)))
           (when emt-use-cache (emt--cache-put str result))
@@ -381,23 +510,28 @@ Set mark ARG words from point or move mark one word."
 ;;; Minor mode
 
 ;;;###autoload
-(defvar emt-mode-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map [remap forward-word] #'emt-forward-word)
-    (define-key map [remap backward-word] #'emt-backward-word)
-    (define-key map [remap kill-word] #'emt-kill-word)
-    (define-key map [remap backward-kill-word] #'emt-backward-kill-word)
-    (define-key map [remap mark-word] #'emt-mark-word)
-    (define-key map [remap word-at-point] #'emt-word-at-point-or-forward)
-    map))
+(defvar emt-mode-map (make-sparse-keymap)
+  "Keymap for `emt-mode'.
+
+EMT no longer remaps word commands.  It installs a
+`find-word-boundary-function-table' handler instead, so this map is
+kept empty for compatibility.")
 
 ;;;###autoload
 (define-minor-mode emt-mode
-  "Minor mode for tokenizing CJK words with macOS's built-in NLP tokenizer."
+  "Minor mode for tokenizing CJK words with macOS's built-in NLP tokenizer.
+
+It installs an emt handler in `find-word-boundary-function-table', so
+commands based on `forward-word' and `backward-word' use emt's
+tokenization."
   :global t
   :keymap emt-mode-map
   :lighter "emt"
-  (when emt-mode (emt-ensure)))
+  (if emt-mode
+      (progn
+        (emt-ensure)
+        (emt--install-boundary-table))
+    (emt--uninstall-boundary-table)))
 
 (provide 'emt)
 
